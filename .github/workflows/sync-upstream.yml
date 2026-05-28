@@ -1,12 +1,15 @@
 name: Sync upstream
 
-# Keeps this fork's master in sync with lwouis/alt-tab-macos and, when there
-# are new commits, kicks off an unsigned DMG build (see build-dmg.yml).
+# Keeps this fork's master in sync with lwouis/alt-tab-macos every day, but
+# only kicks off the (macOS, 10x-billed) DMG build when upstream publishes a
+# NEW RELEASE TAG (v*) -- not on every intermediate commit. This keeps the
+# fork current while spending macOS minutes only ~once per upstream release.
 #
 # master carries fork-only files (these .github/workflows), so we MERGE upstream
-# into master rather than fast-forwarding. The merge is automatic as long as
-# upstream doesn't touch the same workflow files; if it ever conflicts, the job
-# fails and you resolve it manually.
+# into master rather than fast-forwarding. The merge runs daily regardless and
+# is automatic as long as upstream doesn't touch the same workflow files; if it
+# ever conflicts, the job fails and you resolve it manually. Only the build is
+# gated on a new release tag.
 #
 # GitHub cannot push-notify a fork from a repo you do not own, so we poll
 # upstream on a schedule. You can also run this manually from the Actions tab.
@@ -32,13 +35,21 @@ jobs:
           ref: ${{ env.BRANCH }}
           fetch-depth: 0 # full history so fast-forward can be evaluated
 
+      - name: Record current release tag
+        id: before
+        run: |
+          # Highest v* tag we already know about, before fetching upstream.
+          tag=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Latest known release tag: ${tag:-none}"
+
       - name: Fetch upstream
         run: |
           git remote add upstream "$UPSTREAM" || git remote set-url upstream "$UPSTREAM"
           git fetch upstream "$BRANCH" --tags
 
       - name: Merge upstream into fork
-        id: ff
+        id: merge
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -47,7 +58,6 @@ jobs:
           # Nothing new upstream if it's already an ancestor of our master.
           if git merge-base --is-ancestor "$upstream_sha" HEAD; then
             echo "Already up to date."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Merge upstream; --no-edit keeps an automatic merge commit. Fails the
@@ -60,11 +70,20 @@ jobs:
           fi
           git push origin "HEAD:$BRANCH"
           git push origin --tags
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Trigger DMG build
-        if: steps.ff.outputs.changed == 'true'
+      - name: Trigger DMG build only on a new release tag
+        id: after
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run build-dmg.yml --ref "$BRANCH"
+        run: |
+          # Sync always runs (above). The expensive macOS build runs only when
+          # upstream's highest v* tag advanced since the last sync.
+          before='${{ steps.before.outputs.tag }}'
+          after=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          echo "Release tag before: ${before:-none}, after: ${after:-none}"
+          if [[ -n "$after" && "$after" != "$before" ]]; then
+            echo "New upstream release $after -> triggering build."
+            gh workflow run build-dmg.yml --ref "$BRANCH"
+          else
+            echo "No new release tag; skipping the macOS build."
+          fi
