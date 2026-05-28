@@ -1,0 +1,165 @@
+name: Build unsigned DMG
+
+# Builds AltTab from the fork's master into an UNSIGNED, un-notarized DMG and
+# publishes it as a GitHub Release on this fork. This deliberately does NOT use
+# upstream's ci_cd.yml, which signs/notarizes and publishes to upstream's
+# infrastructure (Sparkle feed, website, AppCenter) — none of which apply here.
+#
+# Gatekeeper will block the unsigned app. Users must right-click > Open, or run:
+#   xattr -dr com.apple.quarantine /Applications/AltTab.app
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'fork-v*' # allow re-builds by pushing a fork tag, if ever wanted
+
+permissions:
+  contents: write # needed to create the release
+
+env:
+  APP_NAME: AltTab
+  BUILD_DIR: ${{ github.workspace }}
+  XCODE_BUILD_PATH: DerivedData/Build/Products/Release
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # need tags to derive the version
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 16
+          cache: 'npm'
+
+      - run: sudo xcode-select -s /Applications/Xcode_26.0.1.app/Contents/Developer
+
+      - run: npm ci
+
+      - name: Determine version from latest upstream tag
+        id: version
+        run: |
+          # The fork may not mirror upstream's v* tags, so fetch them directly.
+          git fetch https://github.com/lwouis/alt-tab-macos.git 'refs/tags/v*:refs/tags/v*' --no-tags || true
+          # Highest semver v* tag (e.g. v11.1.0) -> 11.1.0. Fall back to 0.0.0.
+          tag=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          version="${tag#v}"
+          version="${version:-0.0.0}"
+          echo "Building version: $version (from tag ${tag:-none})"
+          echo "$version" > VERSION.txt
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Inject build config (unsigned)
+        run: |
+          # Same xcconfig override mechanism CI/local builds use. release.xcconfig
+          # hardcodes upstream's Developer ID identity and includes local.xcconfig
+          # last, so override the signing settings here to build unsigned. The
+          # fork has no AppCenter secret either, so leave it blank.
+          cat > config/local.xcconfig <<EOF
+          CURRENT_PROJECT_VERSION = ${{ steps.version.outputs.version }}
+          APPCENTER_SECRET =
+          CODE_SIGN_IDENTITY =
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGNING_ALLOWED = NO
+          OTHER_CODE_SIGN_FLAGS =
+          EOF
+
+      - name: Unlock Pro (GPL self-build)
+        run: scripts/fork/apply_pro_unlock.sh
+
+      - name: Build app (unsigned)
+        run: |
+          # Not using scripts/build_app.sh so we can force signing off on the
+          # command line, which beats any xcconfig value.
+          set -o pipefail
+          xcodebuild -project alt-tab-macos.xcodeproj -scheme Release \
+            -derivedDataPath DerivedData \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            | scripts/xcbeautify
+          file "$BUILD_DIR/$XCODE_BUILD_PATH/$APP_NAME.app/Contents/MacOS/$APP_NAME"
+
+      - name: Re-sign ad-hoc with a stable identifier
+        run: |
+          # Xcode's linker-signed adhoc seal changes every build, so macOS treats
+          # each release as a "new" app and re-asks for Accessibility / Screen
+          # Recording permissions. Re-sealing ad-hoc with a FIXED --identifier
+          # gives a stable designated requirement ("identifier ... and adhoc"),
+          # so TCC grants persist across fork updates. (Still unsigned: no Apple
+          # cert involved, just a deterministic ad-hoc identity.)
+          app="$XCODE_BUILD_PATH/$APP_NAME.app"
+          bundle_id="com.lwouis.alt-tab-macos"
+          # Sign nested bundles first, then the app. The key is the explicit
+          # identifier-based designated requirement: without it, ad-hoc signing
+          # defaults to a cdhash requirement that changes every build, so macOS
+          # keeps re-asking for permissions. Pinning the DR to the bundle id
+          # makes every build the "same" app to TCC.
+          find "$app/Contents" \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' \) \
+            -print0 | xargs -0 -I {} codesign --force --sign - {} 2>/dev/null || true
+          codesign --force --deep --identifier "$bundle_id" \
+            -r="designated => identifier \"$bundle_id\"" --sign - "$app"
+          echo "--- signature ---"; codesign -dv "$app" 2>&1 | grep -E 'Identifier|Signature|flags'
+          echo "--- designated requirement ---"; codesign -d -r- "$app" 2>&1 | grep designated
+          codesign --verify --deep --strict "$app"
+
+      - name: Package unsigned DMG
+        id: package
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          app="$XCODE_BUILD_PATH/$APP_NAME.app"
+          dmg="$APP_NAME-$version-unsigned.dmg"
+          # Strip any quarantine attrs, then build a compressed DMG with a
+          # convenience symlink to /Applications.
+          staging=$(mktemp -d)
+          cp -R "$app" "$staging/"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$staging" \
+            -ov -format UDZO "$dmg"
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          tag="fork-v$version"
+          # Write release notes to a file (avoids fragile in-YAML heredocs).
+          {
+            printf '%s\n' "Unsigned build of AltTab produced automatically from upstream (lwouis/alt-tab-macos) by this fork's CI."
+            printf '\n'
+            printf '%s\n' "WARNING: this DMG is **not signed or notarized**. macOS Gatekeeper will block it on first launch. To run it:"
+            printf '\n'
+            printf '%s\n' "1. Open the DMG and drag AltTab to Applications."
+            printf '%s\n' "2. Right-click AltTab in Applications and choose **Open**, then confirm."
+            printf '\n'
+            printf '%s\n' "Or remove the quarantine flag from a terminal:"
+            printf '\n'
+            printf '%s\n' '```'
+            printf '%s\n' "xattr -dr com.apple.quarantine /Applications/AltTab.app"
+            printf '%s\n' '```'
+          } > release_notes.md
+          # Recreate the release if the tag already exists, so re-runs refresh the asset.
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" \
+            --title "AltTab $version (fork, unsigned)" \
+            --notes-file release_notes.md \
+            "${{ steps.package.outputs.dmg }}"
+
+      - name: Notify Homebrew tap
+        # Optional fast-path: the Korel/homebrew-tap cask is normally bumped by
+        # that repo's own daily cron. If you ever want instant updates, create a
+        # fine-grained PAT (Contents: read/write on Korel/homebrew-tap) and store
+        # it as the TAP_DISPATCH_TOKEN secret here; this step then pings the tap
+        # on each release. Left unset by design -> this step is a no-op.
+        # (secrets can't be used in `if:`, so the token presence is checked in-script.)
+        env:
+          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "TAP_DISPATCH_TOKEN not set; tap will update via its own cron."
+            exit 0
+          fi
+          gh api repos/Korel/homebrew-tap/dispatches \
+            -f event_type=new-release
