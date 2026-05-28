@@ -67,6 +67,9 @@ jobs:
           OTHER_CODE_SIGN_FLAGS =
           EOF
 
+      - name: Unlock Pro (GPL self-build)
+        run: scripts/fork/apply_pro_unlock.sh
+
       - name: Build app (unsigned)
         run: |
           # Not using scripts/build_app.sh so we can force signing off on the
