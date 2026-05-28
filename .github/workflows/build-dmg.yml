@@ -120,3 +120,18 @@ jobs:
             --title "AltTab $version (fork, unsigned)" \
             --notes-file release_notes.md \
             "${{ steps.package.outputs.dmg }}"
+
+      - name: Notify Homebrew tap
+        # Optional: if a TAP_DISPATCH_TOKEN (PAT/fine-grained with contents:write
+        # on Korel/homebrew-tap) is configured, ping the tap to bump its cask
+        # immediately. Otherwise the tap's daily cron picks the new release up.
+        # (secrets can't be used in `if:`, so the token presence is checked in-script.)
+        env:
+          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "TAP_DISPATCH_TOKEN not set; tap will update via its own cron."
+            exit 0
+          fi
+          gh api repos/Korel/homebrew-tap/dispatches \
+            -f event_type=new-release
