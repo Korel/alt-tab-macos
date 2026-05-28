@@ -42,10 +42,13 @@ jobs:
       - name: Determine version from latest upstream tag
         id: version
         run: |
-          # Latest v* tag (e.g. v11.1.0) -> 11.1.0. Fall back to 0.0.0 if none.
-          tag=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo v0.0.0)
+          # The fork may not mirror upstream's v* tags, so fetch them directly.
+          git fetch https://github.com/lwouis/alt-tab-macos.git 'refs/tags/v*:refs/tags/v*' --no-tags || true
+          # Highest semver v* tag (e.g. v11.1.0) -> 11.1.0. Fall back to 0.0.0.
+          tag=$(git tag --list 'v*' --sort=-v:refname | head -n1)
           version="${tag#v}"
-          echo "Building version: $version (from tag $tag)"
+          version="${version:-0.0.0}"
+          echo "Building version: $version (from tag ${tag:-none})"
           echo "$version" > VERSION.txt
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -96,26 +99,24 @@ jobs:
         run: |
           version="${{ steps.version.outputs.version }}"
           tag="fork-v$version"
-          notes=$(cat <<'EOF'
-          Unsigned build of AltTab produced automatically from upstream
-          (lwouis/alt-tab-macos) by this fork's CI.
-
-          ⚠️ This DMG is **not signed or notarized**. macOS Gatekeeper will block
-          it on first launch. To run it:
-
-          1. Open the DMG and drag AltTab to Applications.
-          2. Right-click AltTab in Applications and choose **Open**, then confirm.
-
-          Or remove the quarantine flag from a terminal:
-
-          ```
-          xattr -dr com.apple.quarantine /Applications/AltTab.app
-          ```
-          EOF
-          )
+          # Write release notes to a file (avoids fragile in-YAML heredocs).
+          {
+            printf '%s\n' "Unsigned build of AltTab produced automatically from upstream (lwouis/alt-tab-macos) by this fork's CI."
+            printf '\n'
+            printf '%s\n' "WARNING: this DMG is **not signed or notarized**. macOS Gatekeeper will block it on first launch. To run it:"
+            printf '\n'
+            printf '%s\n' "1. Open the DMG and drag AltTab to Applications."
+            printf '%s\n' "2. Right-click AltTab in Applications and choose **Open**, then confirm."
+            printf '\n'
+            printf '%s\n' "Or remove the quarantine flag from a terminal:"
+            printf '\n'
+            printf '%s\n' '```'
+            printf '%s\n' "xattr -dr com.apple.quarantine /Applications/AltTab.app"
+            printf '%s\n' '```'
+          } > release_notes.md
           # Recreate the release if the tag already exists, so re-runs refresh the asset.
           gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$tag" \
             --title "AltTab $version (fork, unsigned)" \
-            --notes "$notes" \
+            --notes-file release_notes.md \
             "${{ steps.package.outputs.dmg }}"
