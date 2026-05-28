@@ -1,7 +1,9 @@
+# NOTE (fork): upstream's production release pipeline (sign, notarize,
+# semantic-release, publish to Sparkle/website/AppCenter) — none of which work
+# in this fork. Kept only to minimize merge conflicts when syncing upstream;
+# set to workflow_dispatch so it never auto-fires. The fork uses build-dmg.yml.
 on:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   APPCENTER_SECRET: ${{ secrets.APPCENTER_SECRET }}
