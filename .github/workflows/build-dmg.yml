@@ -1,0 +1,107 @@
+name: Build unsigned DMG
+
+# Builds AltTab from the fork's master into an UNSIGNED, un-notarized DMG and
+# publishes it as a GitHub Release on this fork. This deliberately does NOT use
+# upstream's ci_cd.yml, which signs/notarizes and publishes to upstream's
+# infrastructure (Sparkle feed, website, AppCenter) — none of which apply here.
+#
+# Gatekeeper will block the unsigned app. Users must right-click > Open, or run:
+#   xattr -dr com.apple.quarantine /Applications/AltTab.app
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'fork-v*' # allow re-builds by pushing a fork tag, if ever wanted
+
+permissions:
+  contents: write # needed to create the release
+
+env:
+  APP_NAME: AltTab
+  BUILD_DIR: ${{ github.workspace }}
+  XCODE_BUILD_PATH: DerivedData/Build/Products/Release
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # need tags to derive the version
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 16
+          cache: 'npm'
+
+      - run: sudo xcode-select -s /Applications/Xcode_26.0.1.app/Contents/Developer
+
+      - run: npm ci
+
+      - name: Determine version from latest upstream tag
+        id: version
+        run: |
+          # Latest v* tag (e.g. v11.1.0) -> 11.1.0. Fall back to 0.0.0 if none.
+          tag=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo v0.0.0)
+          version="${tag#v}"
+          echo "Building version: $version (from tag $tag)"
+          echo "$version" > VERSION.txt
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Inject build config (unsigned)
+        run: |
+          # Same xcconfig override mechanism CI/local builds use. No AppCenter
+          # secret in the fork, so leave it blank.
+          cat > config/local.xcconfig <<EOF
+          CURRENT_PROJECT_VERSION = ${{ steps.version.outputs.version }}
+          APPCENTER_SECRET =
+          EOF
+
+      - name: Build app
+        run: scripts/build_app.sh
+
+      - name: Package unsigned DMG
+        id: package
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          app="$XCODE_BUILD_PATH/$APP_NAME.app"
+          dmg="$APP_NAME-$version-unsigned.dmg"
+          # Strip any quarantine attrs, then build a compressed DMG with a
+          # convenience symlink to /Applications.
+          staging=$(mktemp -d)
+          cp -R "$app" "$staging/"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$staging" \
+            -ov -format UDZO "$dmg"
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          tag="fork-v$version"
+          notes=$(cat <<'EOF'
+          Unsigned build of AltTab produced automatically from upstream
+          (lwouis/alt-tab-macos) by this fork's CI.
+
+          ⚠️ This DMG is **not signed or notarized**. macOS Gatekeeper will block
+          it on first launch. To run it:
+
+          1. Open the DMG and drag AltTab to Applications.
+          2. Right-click AltTab in Applications and choose **Open**, then confirm.
+
+          Or remove the quarantine flag from a terminal:
+
+          ```
+          xattr -dr com.apple.quarantine /Applications/AltTab.app
+          ```
+          EOF
+          )
+          # Recreate the release if the tag already exists, so re-runs refresh the asset.
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" \
+            --title "AltTab $version (fork, unsigned)" \
+            --notes "$notes" \
+            "${{ steps.package.outputs.dmg }}"
