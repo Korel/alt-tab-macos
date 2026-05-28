@@ -1,0 +1,194 @@
+name: Fork DMG on upstream release
+
+# Daily: when lwouis/alt-tab-macos publishes a v* tag we haven't built yet,
+# cherry-pick our fork commit(s) onto that release commit, tag it fork-v<ver>,
+# and build an unsigned DMG from that tag. The tag carries upstream's release
+# code + our fork files; master is never modified. A cherry-pick conflict fails
+# the job for manual fixing.
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to push the fork-v* tag and the release
+
+env:
+  UPSTREAM: https://github.com/lwouis/alt-tab-macos.git
+  APP_NAME: AltTab
+  BUILD_DIR: ${{ github.workspace }}
+  XCODE_BUILD_PATH: DerivedData/Build/Products/Release
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      needs-build: ${{ steps.check.outputs.needs-build }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history so we can cherry-pick onto an old tag
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM" || git remote set-url upstream "$UPSTREAM"
+          git fetch upstream --tags
+
+      - name: Tag and flag a build when upstream has a release we haven't built
+        id: check
+        run: |
+          set -euo pipefail
+          trap 'echo "::error::${BASH_SOURCE[0]}:$LINENO: $BASH_COMMAND"' ERR
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Tags were fetched above; compare locally (numeric, no 'v' prefix).
+          v_upstream=$(git tag --list 'v*' --sort=-v:refname | head -n1) # e.g. v11.4.0
+          version="${v_upstream#v}"                                      # 11.4.0
+          v_fork=$(git tag -l 'fork-v*' --sort=-v:refname | head -n1 | sed 's/^fork-v//')
+          if [[ "$version" == "$v_fork" ]]; then
+            echo "fork-v$version already built; skipping."
+            exit 0
+          fi
+
+          # Replay our fork commit(s) -- everything on master not in upstream --
+          # onto the release commit, linear with no merge commit. The branch is
+          # local only: pushing the tag uploads its commit, so master is untouched.
+          git checkout --orphan build-tmp "$v_upstream"
+
+          # Avoid pushing upstream workflow files/history into this fork tag.
+          git rm -r --cached --ignore-unmatch .github/workflows
+          rm -rf .github/workflows
+
+          git checkout master -- scripts/fork
+          git add -A
+          git commit -m "chore: snapshot fork files for upstream release $v_upstream"
+
+          git tag "fork-v$version"
+          git push origin "fork-v$version"
+
+          echo "needs-build=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.needs-build == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: "fork-v${{ needs.sync.outputs.version }}" # the tag sync just pushed
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 16
+          cache: 'npm'
+
+      - run: sudo xcode-select -s /Applications/Xcode_26.0.1.app/Contents/Developer
+
+      - run: npm ci
+
+      - name: Inject build config (unsigned)
+        run: |
+          # local.xcconfig is included last by release.xcconfig, so these
+          # override its hardcoded signing identity to build unsigned. No
+          # AppCenter secret in the fork, so blank it too.
+          cat > config/local.xcconfig <<EOF
+          CURRENT_PROJECT_VERSION = ${{ needs.sync.outputs.version }}
+          APPCENTER_SECRET =
+          CODE_SIGN_IDENTITY =
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGNING_ALLOWED = NO
+          OTHER_CODE_SIGN_FLAGS =
+          EOF
+
+      - name: Unlock Pro (GPL self-build)
+        run: scripts/fork/apply_pro_unlock.sh
+
+      - name: Build app (unsigned)
+        run: |
+          # Bypass scripts/build_app.sh to force signing off on the command
+          # line, which overrides any xcconfig value.
+          set -o pipefail
+          xcodebuild -project alt-tab-macos.xcodeproj -scheme Release \
+            -derivedDataPath DerivedData \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            | scripts/xcbeautify
+          file "$BUILD_DIR/$XCODE_BUILD_PATH/$APP_NAME.app/Contents/MacOS/$APP_NAME"
+
+      - name: Re-sign ad-hoc with a stable identifier
+        run: |
+          # Xcode's default adhoc seal uses a cdhash requirement that changes
+          # every build, so macOS re-asks for Accessibility/Screen Recording on
+          # each update. Re-sealing with a fixed --identifier pins the designated
+          # requirement to the bundle id, so TCC grants persist across updates.
+          # Still unsigned: no Apple cert, just a deterministic ad-hoc identity.
+          app="$XCODE_BUILD_PATH/$APP_NAME.app"
+          bundle_id="com.lwouis.alt-tab-macos"
+          # Sign nested bundles first, then the app.
+          find "$app/Contents" \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' \) \
+            -print0 | xargs -0 -I {} codesign --force --sign - {} 2>/dev/null || true
+          codesign --force --deep --identifier "$bundle_id" \
+            -r="designated => identifier \"$bundle_id\"" --sign - "$app"
+          echo "--- signature ---"; codesign -dv "$app" 2>&1 | grep -E 'Identifier|Signature|flags'
+          echo "--- designated requirement ---"; codesign -d -r- "$app" 2>&1 | grep designated
+          codesign --verify --deep --strict "$app"
+
+      - name: Package unsigned DMG
+        id: package
+        run: |
+          version="${{ needs.sync.outputs.version }}"
+          app="$XCODE_BUILD_PATH/$APP_NAME.app"
+          dmg="$APP_NAME-$version-unsigned.dmg"
+          # Compressed DMG with a convenience symlink to /Applications.
+          staging=$(mktemp -d)
+          cp -R "$app" "$staging/"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname "$APP_NAME" -srcfolder "$staging" \
+            -ov -format UDZO "$dmg"
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ needs.sync.outputs.version }}"
+          tag="fork-v$version"
+          {
+            printf '%s\n' "Unsigned build of AltTab produced automatically from upstream (lwouis/alt-tab-macos) by this fork's CI."
+            printf '\n'
+            printf '%s\n' "WARNING: this DMG is **not signed or notarized**. macOS Gatekeeper will block it on first launch. To run it:"
+            printf '\n'
+            printf '%s\n' "1. Open the DMG and drag AltTab to Applications."
+            printf '%s\n' "2. Right-click AltTab in Applications and choose **Open**, then confirm."
+            printf '\n'
+            printf '%s\n' "Or remove the quarantine flag from a terminal:"
+            printf '\n'
+            printf '%s\n' '```'
+            printf '%s\n' "xattr -dr com.apple.quarantine /Applications/AltTab.app"
+            printf '%s\n' '```'
+          } > release_notes.md
+          # Refresh the release on re-runs, but keep the tag sync pushed (it
+          # points at the built commit; --cleanup-tag would move it to master).
+          gh release delete "$tag" --yes 2>/dev/null || true
+          gh release create "$tag" \
+            --title "AltTab $version (fork, unsigned)" \
+            --notes-file release_notes.md \
+            "${{ steps.package.outputs.dmg }}"
+
+      - name: Notify Homebrew tap
+        # Optional fast-path. Korel/homebrew-tap normally updates via its own
+        # daily cron; for instant updates, set the TAP_DISPATCH_TOKEN secret
+        # (fine-grained PAT, Contents: read/write on the tap). Unset -> no-op.
+        # (secrets can't be used in `if:`, so we check the token in-script.)
+        env:
+          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "TAP_DISPATCH_TOKEN not set; tap will update via its own cron."
+            exit 0
+          fi
+          gh api repos/Korel/homebrew-tap/dispatches \
+            -f event_type=new-release
