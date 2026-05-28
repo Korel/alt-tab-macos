@@ -1,7 +1,11 @@
+# NOTE (fork): This is upstream's (lwouis/alt-tab-macos) production release
+# pipeline. It signs, notarizes, runs semantic-release, and publishes to
+# upstream's Sparkle feed / website / AppCenter — none of which work in this
+# fork. It is kept here only to minimize merge conflicts when syncing upstream.
+# It is intentionally NOT triggered on push. The fork builds DMGs via
+# build-dmg.yml instead. Left as workflow_dispatch so it never auto-fires.
 on:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   APPCENTER_SECRET: ${{ secrets.APPCENTER_SECRET }}

@@ -1,0 +1,70 @@
+name: Sync upstream
+
+# Keeps this fork's master in sync with lwouis/alt-tab-macos and, when there
+# are new commits, kicks off an unsigned DMG build (see build-dmg.yml).
+#
+# master carries fork-only files (these .github/workflows), so we MERGE upstream
+# into master rather than fast-forwarding. The merge is automatic as long as
+# upstream doesn't touch the same workflow files; if it ever conflicts, the job
+# fails and you resolve it manually.
+#
+# GitHub cannot push-notify a fork from a repo you do not own, so we poll
+# upstream on a schedule. You can also run this manually from the Actions tab.
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to push the synced commits
+
+env:
+  UPSTREAM: https://github.com/lwouis/alt-tab-macos.git
+  BRANCH: master
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0 # full history so fast-forward can be evaluated
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM" || git remote set-url upstream "$UPSTREAM"
+          git fetch upstream "$BRANCH" --tags
+
+      - name: Merge upstream into fork
+        id: ff
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          upstream_sha=$(git rev-parse "upstream/$BRANCH")
+          echo "Upstream: $upstream_sha"
+          # Nothing new upstream if it's already an ancestor of our master.
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Already up to date."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Merge upstream; --no-edit keeps an automatic merge commit. Fails the
+          # job on conflict (e.g. upstream edited our workflow files) so it can
+          # be resolved by hand rather than pushing a broken tree.
+          if ! git merge --no-edit "upstream/$BRANCH"; then
+            git merge --abort || true
+            echo "::error::Merge from upstream/$BRANCH conflicts with fork changes. Resolve manually."
+            exit 1
+          fi
+          git push origin "HEAD:$BRANCH"
+          git push origin --tags
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger DMG build
+        if: steps.ff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-dmg.yml --ref "$BRANCH"
