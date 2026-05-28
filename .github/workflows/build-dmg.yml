@@ -122,9 +122,11 @@ jobs:
             "${{ steps.package.outputs.dmg }}"
 
       - name: Notify Homebrew tap
-        # Optional: if a TAP_DISPATCH_TOKEN (PAT/fine-grained with contents:write
-        # on Korel/homebrew-tap) is configured, ping the tap to bump its cask
-        # immediately. Otherwise the tap's daily cron picks the new release up.
+        # Optional fast-path: the Korel/homebrew-tap cask is normally bumped by
+        # that repo's own daily cron. If you ever want instant updates, create a
+        # fine-grained PAT (Contents: read/write on Korel/homebrew-tap) and store
+        # it as the TAP_DISPATCH_TOKEN secret here; this step then pings the tap
+        # on each release. Left unset by design -> this step is a no-op.
         # (secrets can't be used in `if:`, so the token presence is checked in-script.)
         env:
           GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
