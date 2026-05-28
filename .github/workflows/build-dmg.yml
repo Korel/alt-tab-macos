@@ -78,6 +78,29 @@ jobs:
             | scripts/xcbeautify
           file "$BUILD_DIR/$XCODE_BUILD_PATH/$APP_NAME.app/Contents/MacOS/$APP_NAME"
 
+      - name: Re-sign ad-hoc with a stable identifier
+        run: |
+          # Xcode's linker-signed adhoc seal changes every build, so macOS treats
+          # each release as a "new" app and re-asks for Accessibility / Screen
+          # Recording permissions. Re-sealing ad-hoc with a FIXED --identifier
+          # gives a stable designated requirement ("identifier ... and adhoc"),
+          # so TCC grants persist across fork updates. (Still unsigned: no Apple
+          # cert involved, just a deterministic ad-hoc identity.)
+          app="$XCODE_BUILD_PATH/$APP_NAME.app"
+          bundle_id="com.lwouis.alt-tab-macos"
+          # Sign nested bundles first, then the app. The key is the explicit
+          # identifier-based designated requirement: without it, ad-hoc signing
+          # defaults to a cdhash requirement that changes every build, so macOS
+          # keeps re-asking for permissions. Pinning the DR to the bundle id
+          # makes every build the "same" app to TCC.
+          find "$app/Contents" \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' \) \
+            -print0 | xargs -0 -I {} codesign --force --sign - {} 2>/dev/null || true
+          codesign --force --deep --identifier "$bundle_id" \
+            -r="designated => identifier \"$bundle_id\"" --sign - "$app"
+          echo "--- signature ---"; codesign -dv "$app" 2>&1 | grep -E 'Identifier|Signature|flags'
+          echo "--- designated requirement ---"; codesign -d -r- "$app" 2>&1 | grep designated
+          codesign --verify --deep --strict "$app"
+
       - name: Package unsigned DMG
         id: package
         run: |
