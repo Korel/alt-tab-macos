@@ -83,7 +83,11 @@ jobs:
           echo "Release tag before: ${before:-none}, after: ${after:-none}"
           if [[ -n "$after" && "$after" != "$before" ]]; then
             echo "New upstream release $after -> triggering build."
-            gh workflow run build-dmg.yml --ref "$BRANCH"
+            # Pin to the fork: this step added an 'upstream' remote pointing at
+            # lwouis/alt-tab-macos, and gh would otherwise resolve the target
+            # repo to that remote (it prefers 'upstream' over 'origin'), causing
+            # a 404 since build-dmg.yml only exists in the fork.
+            gh workflow run build-dmg.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
           else
             echo "No new release tag; skipping the macOS build."
           fi
