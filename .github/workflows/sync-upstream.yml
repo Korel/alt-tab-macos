@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write # needed to push the synced commits
+  actions: write  # needed to trigger workflow_dispatch on build-dmg.yml
 
 env:
   UPSTREAM: https://github.com/lwouis/alt-tab-macos.git
