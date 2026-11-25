@@ -38,6 +38,8 @@ jobs:
 
       - name: Tag and flag a build when upstream has a release we haven't built
         id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           trap 'echo "::error::${BASH_SOURCE[0]}:$LINENO: $BASH_COMMAND"' ERR
@@ -47,9 +49,17 @@ jobs:
           # Tags were fetched above; compare locally (numeric, no 'v' prefix).
           v_upstream=$(git tag --list 'v*' --sort=-v:refname | head -n1) # e.g. v11.4.0
           version="${v_upstream#v}"                                      # 11.4.0
-          v_fork=$(git tag -l 'fork-v*' --sort=-v:refname | head -n1 | sed 's/^fork-v//')
-          if [[ "$version" == "$v_fork" ]]; then
-            echo "fork-v$version already built; skipping."
+          # Skip on the release, not the tag: a build that fails after the tag is
+          # pushed (e.g. no macOS runner) must be retried on the next run.
+          # -R is required: gh would otherwise resolve to the 'upstream' remote.
+          if gh release view "fork-v$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "fork-v$version already released; skipping."
+            exit 0
+          fi
+          if git rev-parse -q --verify "refs/tags/fork-v$version" >/dev/null; then
+            echo "fork-v$version tagged but unreleased; rebuilding."
+            echo "needs-build=true" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
